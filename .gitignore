@@ -1,0 +1,7 @@
+# Python-generated files
+data
+results
+src/__pycache__
+
+# Virtual environments
+.venv
