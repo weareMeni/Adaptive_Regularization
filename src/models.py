@@ -239,7 +239,7 @@ class UniversalACTWrapper(nn.Module):
         
         self.step_embed = nn.Embedding(max_steps + 1, dim)
         self.halting_gate = nn.Linear(dim, 1)
-        self.halting_gate.bias.data.fill_(-3.0) # Strong bias to encourage depth
+        self.halting_gate.bias.data.fill_(-8.0) # Strong bias to encourage depth
 
     def forward(self, x):
         B, T, C = x.shape

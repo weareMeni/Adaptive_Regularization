@@ -75,44 +75,58 @@ def main():
                 
             if device.type == "cuda":
                 print("Compiling model for CUDA...")
-
                 cache_dir = "/iopsstor/scratch/cscs/course_00151/torch_cache"
                 os.makedirs(cache_dir, exist_ok=True)
                 os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
-                
                 model = torch.compile(model, mode="reduce-overhead")
             else:
                 print("Running locally on Mac/CPU. Skipping torch.compile.")
             
-            optimizer = optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=5e-1)
+            optimizer = optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-1)
             criterion = nn.CrossEntropyLoss()
 
             for epoch in range(epochs):
                 model.train()
                 correct, total = 0, 0
+                total_steps = 0.0
+
+                target_penalty = 0.01
+                if epoch < 30:
+                    current_ponder_weight = 0.0
+                else:
+                    current_ponder_weight = min(target_penalty, target_penalty * ((epoch - 30) / 25.0))
                 
                 for x, y in trainloader:
                     x, y = x.to(device), y.to(device)
                     optimizer.zero_grad()
                     
-                    out, ponder_cost = model(x)
+                    output = model(x)
+                    if isinstance(output, tuple):
+                        out, ponder_cost = output
+                    else:
+                        out = output
+                        ponder_cost = torch.tensor(0.0, device=device)
+
                     loss = criterion(out, y)
-
-                    target_penalty = 0.01
-                    ponder_weight = min(target_penalty, target_penalty * (epoch / 25.0))
-
-                    total_loss = loss + (ponder_weight * ponder_cost)
+                    total_loss = loss + (current_ponder_weight * ponder_cost)
+                    
                     total_loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                     
                     correct += (out.argmax(1) == y).sum().item() 
                     total += y.size(0)
+                    total_steps += ponder_cost.item()
                 
                 # Print stats every epoch, or adjust modulo to print less frequently
                 if (epoch + 1) % 1 == 0 or epoch == epochs - 1 or epoch == 0:
                     test_loss, test_acc = evaluate(model, testloader, criterion, device)
-                    print(f"Epoch {epoch+1:02d} | Train Acc: {100*correct/total:.1f}% | Test Acc: {test_acc:.1f}%")
+                    avg_steps = total_steps / len(trainloader)
+                    
+                    if model_name == "Universal_LLM":
+                        print(f"Epoch {epoch+1:02d} | Train Acc: {100*correct/total:.1f}% | Test Acc: {test_acc:.1f}% | Avg Steps: {avg_steps:.2f}")
+                    else:
+                        print(f"Epoch {epoch+1:02d} | Train Acc: {100*correct/total:.1f}% | Test Acc: {test_acc:.1f}%")
 
             master_results.append({
                 "Task": task,
