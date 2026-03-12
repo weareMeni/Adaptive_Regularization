@@ -5,7 +5,7 @@ import pandas as pd
 import os
 
 # Import all three distinct architectures
-from src.models import IndustryStandardLLM, RecurrentLLM, ExperimentalLLM, UniversalLLM
+from src.models import IndustryStandardLLM, RecurrentLLM, UniversalLLM
 from src.data_loader import get_dyck_extrapolation_loaders, get_associative_recall_loaders, get_listops_loaders
 
 def evaluate(model, testloader, criterion, device):
@@ -33,8 +33,8 @@ def main():
     device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
     
     # --- THE GAUNTLET ---
-    TASKS = ["LISTOPS"] # ["RECALL", "DYCK_EXTRAPOLATE", "LISTOPS"]
-    MODELS = ["Universal_LLM"] 
+    TASKS = ["LISTOPS", "DYCK_EXTRAPOLATE"] # ["RECALL", "DYCK_EXTRAPOLATE", "LISTOPS"]
+    MODELS = ["Universal_LLM", "RECURRENT_LLM"] 
     
     NUM_LAYERS = 4 
     BATCH_SIZE = 64
@@ -64,9 +64,7 @@ def main():
             print(f"\n--- Running {model_name} on {task} ---")
             
             # Dynamically instantiate the correct model architecture
-            if model_name == "EXPERIMENTAL_LLM":
-                model = ExperimentalLLM(vocab_size, num_classes, DIM, nhead=4, num_layers=NUM_LAYERS, max_seq_len=5000).to(device)
-            elif model_name == "RECURRENT_LLM":
+            if model_name == "RECURRENT_LLM":
                 model = RecurrentLLM(vocab_size, num_classes, DIM, nhead=4, num_layers=NUM_LAYERS, max_seq_len=5000).to(device)
             elif model_name == "INDUSTRY_LLM":
                 model = IndustryStandardLLM(vocab_size, num_classes, DIM, nhead=4, num_layers=NUM_LAYERS, max_seq_len=5000).to(device)
