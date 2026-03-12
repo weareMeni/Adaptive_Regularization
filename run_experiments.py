@@ -73,7 +73,17 @@ def main():
             else:
                 raise ValueError(f"Unknown model name: {model_name}")
                 
-            model = torch.compile(model)
+            if device.type == "cuda":
+                print("Compiling model for CUDA...")
+
+                cache_dir = "/iopsstor/scratch/cscs/course_00151/torch_cache"
+                os.makedirs(cache_dir, exist_ok=True)
+                os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+                
+                model = torch.compile(model, mode="reduce-overhead")
+            else:
+                print("Running locally on Mac/CPU. Skipping torch.compile.")
+            
             optimizer = optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=5e-1)
             criterion = nn.CrossEntropyLoss()
 
