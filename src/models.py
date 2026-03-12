@@ -3,6 +3,16 @@ import torch.nn as nn
 import math
 import torch.nn.functional as F
 
+# ---------------------------------------------------------
+# Dynamic Hardware Routing for Mamba
+# ---------------------------------------------------------
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    HAS_MAMBA = True
+except ImportError:
+    HAS_MAMBA = False
+    print("WARNING: mamba_ssm not found. Falling back to slow Python loop (expected on Mac).")
+
 # ==========================================
 # SHARED UTILITIES & FFN
 # ==========================================
@@ -108,10 +118,22 @@ class RecurrentAttention(nn.Module):
         B_batch, T, C_dim = x_raw.shape
         device = x_raw.device
 
-        delta = F.softplus(proj_delta(x_raw))
+        delta = proj_delta(x_raw)
         B_mat = proj_B(x_raw)
         C_mat = proj_C(x_raw)
         A = -torch.exp(A_log).to(device)
+
+        if HAS_MAMBA and device.type == 'cuda':
+            x_base_t = x_base.transpose(1, 2).contiguous()
+            delta_t = delta.transpose(1, 2).contiguous()
+            B_mat_t = B_mat.transpose(1, 2).contiguous()
+            C_mat_t = C_mat.transpose(1, 2).contiguous()
+
+            out_t = selective_scan_fn(
+                x_base_t, delta_t, A, B_mat_t, C_mat_t, 
+                None, None, None, delta_softplus=True
+            )
+            return out_t.transpose(1, 2).contiguous()
 
         h = torch.zeros(B_batch, C_dim, self.state_dim, device=device)
         out_seq = []
@@ -208,52 +230,44 @@ class RecurrentLLM(nn.Module):
         if return_residual:
             return logits, residual_state
         return logits
-
-# ==========================================
-# 3. COUPLED-STATE EXPERIMENTAL TRANSFORMER
-# ==========================================
+    
 class UniversalACTWrapper(nn.Module):
     def __init__(self, layer, dim, max_steps=12):
         super().__init__()
         self.layer = layer
         self.max_steps = max_steps
         
-        # Step Embedding: Gives the network awareness of its current loop iteration
         self.step_embed = nn.Embedding(max_steps + 1, dim)
-        
-        # Halting Gate
         self.halting_gate = nn.Linear(dim, 1)
-        # Initialize bias to -2.0 to force the network to ponder for a few steps early in training
-        self.halting_gate.bias.data.fill_(-2.0)
+        self.halting_gate.bias.data.fill_(-3.0) # Strong bias to encourage depth
 
     def forward(self, x):
         B, T, C = x.shape
         device = x.device
 
-        accumulated_probs = torch.zeros(B, T, 1, device=device)
-        output_state = torch.zeros_like(x)
-        updates = torch.zeros(B, T, 1, device=device)
+        # Track probabilities globally for the sequence (B, 1, 1)
+        accumulated_probs = torch.zeros(B, 1, 1, device=device)
+        updates = torch.zeros(B, 1, 1, device=device)
+        active_mask = torch.ones(B, 1, 1, device=device, dtype=torch.bool)
         
-        active_mask = torch.ones(B, T, 1, device=device, dtype=torch.bool)
+        output_state = torch.zeros_like(x)
         
         for step in range(1, self.max_steps + 1):
-            # 1. Inject the Step Embedding
             step_tensor = torch.full((B, T), step, device=device, dtype=torch.long)
             step_emb = self.step_embed(step_tensor)
             
-            # 2. Pass the step-aware state through the shared layer
             x_in = x + step_emb
             x = self.layer(x_in)
             
-            # 3. Compute Halting Probability
-            p_t = torch.sigmoid(self.halting_gate(x))
+            # Predict halting per token, then average across sequence
+            raw_p_t = torch.sigmoid(self.halting_gate(x)) 
+            p_t = raw_p_t.mean(dim=1, keepdim=True)       
             
             if step == self.max_steps:
                 is_halting_now = active_mask
             else:
                 is_halting_now = (accumulated_probs + p_t >= 1.0) & active_mask
             
-            # 4. Calculate step weights
             step_weight = torch.where(
                 is_halting_now, 
                 1.0 - accumulated_probs, 
@@ -261,10 +275,8 @@ class UniversalACTWrapper(nn.Module):
             )
             step_weight = step_weight * active_mask.float()
             
-            # 5. Accumulate the output
             output_state = output_state + (step_weight * x)
             
-            # 6. Update tracking variables
             accumulated_probs = accumulated_probs + step_weight
             updates = updates + active_mask.float()
             active_mask = active_mask & ~is_halting_now
@@ -274,98 +286,6 @@ class UniversalACTWrapper(nn.Module):
                 
         ponder_cost = updates.mean()
         return output_state, ponder_cost
-    
-class GatedLinearStateAttention(nn.Module):
-    def __init__(self, dim, num_heads):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-
-        # 1. Projections for the Gated Memory Matrix
-        self.state_q = nn.Linear(dim, dim)
-        self.state_k = nn.Linear(dim, dim)
-        self.state_v = nn.Linear(dim, dim)
-        
-        # The Data-Dependent Gate (The core difference from our previous attempt)
-        # Outputs one gate scalar per head
-        self.state_gate = nn.Linear(dim, num_heads)
-
-        # 2. Projections for the final Softmax Attention
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        
-        self.proj_out = nn.Linear(dim, dim)
-        
-        # Learned temperature scalar to scale the normalized dot product
-        self.temperature = nn.Parameter(torch.ones(1, num_heads, 1, 1))
-
-    def forward(self, x):
-        B, T, C = x.shape
-        device = x.device
-
-        # --- PART A: Build the Gated Memory Matrix ---
-        sq = self.state_q(x).view(B, T, self.num_heads, self.head_dim)
-        sk = self.state_k(x).view(B, T, self.num_heads, self.head_dim)
-        sv = self.state_v(x).view(B, T, self.num_heads, self.head_dim)
-        
-        # Generate the data-dependent exponential decay gate
-        # shape: (B, T, num_heads, 1, 1) to broadcast across the head_dim x head_dim matrix
-        gate_logits = self.state_gate(x)
-        # We use -softplus to ensure the value is strictly negative, so exp() is between 0 and 1
-        g_t = torch.exp(-F.softplus(gate_logits)).view(B, T, self.num_heads, 1, 1)
-
-        M = torch.zeros(B, self.num_heads, self.head_dim, self.head_dim, device=device)
-        h_seq = []
-
-        # Sequential scan (In production GLA, this is a parallel chunkwise kernel)
-        for t in range(T):
-            sk_t = sk[:, t, :, :].unsqueeze(-1) # (B, num_heads, head_dim, 1)
-            sv_t = sv[:, t, :, :].unsqueeze(-2) # (B, num_heads, 1, head_dim)
-            
-            # Data-dependent decay + new outer product
-            M = g_t[:, t] * M + (sk_t @ sv_t)
-            
-            # Read from the memory matrix
-            sq_t = sq[:, t, :, :].unsqueeze(-2) # (B, num_heads, 1, head_dim)
-            h_t = (sq_t @ M).squeeze(-2)        # (B, num_heads, head_dim)
-            
-            h_seq.append(h_t)
-
-        # The context-aware state sequence
-        H = torch.stack(h_seq, dim=1).view(B, T, C)
-
-        # --- PART B: The Chimera Routing ---
-        # We use the GLA state H to generate our routing queries and keys
-        Q = self.q_proj(H).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.k_proj(H).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.v_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # BOTTLENECK FIX: L2 Normalize Q and K to prevent length-extrapolation explosion
-        Q = F.normalize(Q, p=2, dim=-1)
-        K = F.normalize(K, p=2, dim=-1)
-
-        # Cosine Attention
-        scores = (Q @ K.transpose(-2, -1)) * F.softplus(self.temperature)
-        attn = scores.softmax(dim=-1)
-        
-        out = (attn @ V).transpose(1, 2).reshape(B, T, C)
-
-        return self.proj_out(out)
-
-class CoupledStateTransformerLayer(nn.Module):
-    def __init__(self, dim, nhead):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = GatedLinearStateAttention(dim, nhead)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ffwd = SwiGLU_FFN(dim)
-
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.ffwd(self.norm2(x))
-        return x
 
 class UniversalLLM(nn.Module):
     def __init__(self, vocab_size, num_classes, dim, nhead, max_steps=12, max_seq_len=5000):
@@ -373,10 +293,7 @@ class UniversalLLM(nn.Module):
         self.embed = nn.Embedding(vocab_size, dim)
         self.pos_encoder = PositionalEncoding(dim, max_seq_len) 
         
-        # Instantiate the SINGLE core Bidirectional Mamba + Attention layer
         core_layer = RecurrentTransformerLayer(dim, nhead)
-        
-        # Wrap it in ACT
         self.universal_layer = UniversalACTWrapper(core_layer, dim, max_steps=max_steps)
         
         self.layer_norm = nn.LayerNorm(dim)
@@ -386,10 +303,10 @@ class UniversalLLM(nn.Module):
         h = self.embed(x)
         h = self.pos_encoder(h)
         
-        # Execute the dynamic depth loop
         h, ponder_cost = self.universal_layer(h)
         residual_state = h 
         
+        # Pool across sequence for final classification
         h_pooled = h.mean(dim=1)
         h_final = self.layer_norm(h_pooled)
         
@@ -398,24 +315,3 @@ class UniversalLLM(nn.Module):
         if return_residual:
             return logits, ponder_cost, residual_state
         return logits, ponder_cost
-    
-class ExperimentalLLM(nn.Module):
-    def __init__(self, vocab_size, num_classes, dim, nhead, num_layers, max_seq_len=1000):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, dim)
-        self.pos_encoder = PositionalEncoding(dim, max_seq_len)
-        self.layers = nn.ModuleList([CoupledStateTransformerLayer(dim, nhead) for _ in range(num_layers)])
-        self.layer_norm = nn.LayerNorm(dim)
-        self.fc = nn.Linear(dim, num_classes)
-
-    def forward(self, x, return_residual=False):
-        h = self.embed(x)
-        h = self.pos_encoder(h)
-        for layer in self.layers:
-            h = layer(h)
-        residual_state = h 
-        h_final = self.layer_norm(h[:, -1, :])
-        logits = self.fc(h_final)
-        if return_residual:
-            return logits, residual_state
-        return logits

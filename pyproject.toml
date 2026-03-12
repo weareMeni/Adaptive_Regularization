@@ -12,4 +12,6 @@ dependencies = [
     "scikit-learn>=1.8.0",
     "torch>=2.10.0",
     "torchvision>=0.25.0",
+    "mamba-ssm; sys_platform == 'linux'",
+    "causal-conv1d; sys_platform == 'linux'"
 ]

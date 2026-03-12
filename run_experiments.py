@@ -75,6 +75,7 @@ def main():
             else:
                 raise ValueError(f"Unknown model name: {model_name}")
                 
+            model = torch.compile(model)
             optimizer = optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=5e-1)
             criterion = nn.CrossEntropyLoss()
 
