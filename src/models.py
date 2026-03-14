@@ -118,22 +118,10 @@ class RecurrentAttention(nn.Module):
         B_batch, T, C_dim = x_raw.shape
         device = x_raw.device
 
-        delta = proj_delta(x_raw)
+        delta = F.softplus(proj_delta(x_raw))
         B_mat = proj_B(x_raw)
         C_mat = proj_C(x_raw)
         A = -torch.exp(A_log).to(device)
-
-        if HAS_MAMBA and device.type == 'cuda':
-            x_base_t = x_base.transpose(1, 2).contiguous()
-            delta_t = delta.transpose(1, 2).contiguous()
-            B_mat_t = B_mat.transpose(1, 2).contiguous()
-            C_mat_t = C_mat.transpose(1, 2).contiguous()
-
-            out_t = selective_scan_fn(
-                x_base_t, delta_t, A, B_mat_t, C_mat_t, 
-                None, None, None, delta_softplus=True
-            )
-            return out_t.transpose(1, 2).contiguous()
 
         h = torch.zeros(B_batch, C_dim, self.state_dim, device=device)
         out_seq = []
@@ -212,23 +200,138 @@ class RecurrentLLM(nn.Module):
     def __init__(self, vocab_size, num_classes, dim, nhead, num_layers, max_seq_len=1000):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
-        # Note: Recurrent/HiPPO models often don't strictly need positional encoding, 
-        # but we keep it here for an apples-to-apples comparison.
-        self.pos_encoder = PositionalEncoding(dim, max_seq_len)
         self.layers = nn.ModuleList([RecurrentTransformerLayer(dim, nhead) for _ in range(num_layers)])
         self.layer_norm = nn.LayerNorm(dim)
         self.fc = nn.Linear(dim, num_classes)
 
     def forward(self, x, return_residual=False):
         h = self.embed(x)
-        h = self.pos_encoder(h)
         for layer in self.layers:
             h = layer(h)
         residual_state = h 
-        h_final = self.layer_norm(h[:, -1, :])
-        logits = self.fc(h_final)
+        h_norm = self.layer_norm(h)
+        logits = self.fc(h_norm)
         if return_residual:
             return logits, residual_state
+        return logits
+    
+class CausalRecurrentAttention(nn.Module):
+    def __init__(self, dim, num_heads, state_dim=16):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.state_dim = state_dim
+
+        # Forward Scan Parameters (Left-to-Right ONLY)
+        A_fwd = torch.arange(1, state_dim + 1, dtype=torch.float32).repeat(dim, 1)
+        self.A_log_fwd = nn.Parameter(torch.log(A_fwd))
+
+        self.proj_delta_fwd = nn.Linear(dim, dim)
+        nn.init.constant_(self.proj_delta_fwd.bias, -3.0)
+
+        self.proj_B_fwd = nn.Linear(dim, state_dim, bias=False)
+        self.proj_C_fwd = nn.Linear(dim, state_dim, bias=False)
+
+        # Independent Projections for Q, K, V
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.proj_out = nn.Linear(dim, dim)
+        self.x_proj = nn.Linear(dim, dim)
+        
+        self.scan_norm = nn.LayerNorm(dim)
+        self.temperature = nn.Parameter(torch.ones(1, num_heads, 1, 1) * 0.5)
+
+    def _selective_scan(self, x_base, x_raw):
+        B_batch, T, C_dim = x_raw.shape
+        device = x_raw.device
+
+        delta = F.softplus(self.proj_delta_fwd(x_raw))
+        B_mat = self.proj_B_fwd(x_raw)
+        C_mat = self.proj_C_fwd(x_raw)
+
+        A = -torch.exp(self.A_log_fwd).to(device)
+
+        h = torch.zeros(B_batch, C_dim, self.state_dim, device=device)
+        out_seq = []
+
+        for t in range(T):
+            x_t = x_base[:, t, :].unsqueeze(-1)
+            delta_t = delta[:, t, :].unsqueeze(-1)
+            B_t = B_mat[:, t, :].unsqueeze(1)
+            C_t = C_mat[:, t, :].unsqueeze(1)
+
+            bar_A = torch.exp(delta_t * A)
+            bar_B = delta_t * B_t
+
+            h = bar_A * h + bar_B * x_t
+            y_t = (h * C_t).sum(dim=-1)
+            out_seq.append(y_t)
+
+        return torch.stack(out_seq, dim=1)
+
+    def forward(self, x):
+        B_batch, T, C_dim = x.shape
+        device = x.device
+
+        x_base = self.x_proj(x)
+
+        # 1. Forward Scan ONLY
+        out_fwd = self._selective_scan(x_base, x)
+
+        # 2. Hybrid State (Residual connection helps keep identity sharp)
+        hybrid_state = self.scan_norm(x_base + out_fwd)
+
+        # 3. Project Q, K, V
+        Q = self.q_proj(hybrid_state).view(B_batch, T, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(hybrid_state).view(B_batch, T, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(hybrid_state).view(B_batch, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # 4. Scaled Dot-Product Attention
+        scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = scores * F.softplus(self.temperature)
+
+        # 5. Causal Masking (Force the model to only look at the past)
+        mask = torch.tril(torch.ones(T, T, device=device)).view(1, 1, T, T)
+        scores = scores.masked_fill(mask == 0, float('-inf'))
+
+        attn = scores.softmax(dim=-1)
+        out = (attn @ V).transpose(1, 2).reshape(B_batch, T, C_dim)
+
+        return self.proj_out(out)
+    
+class CausalRecurrentTransformerLayer(nn.Module):
+    def __init__(self, dim, nhead):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = CausalRecurrentAttention(dim, nhead)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffwd = SwiGLU_FFN(dim)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ffwd(self.norm2(x))
+        return x
+
+class CausalRecurrentLLM(nn.Module):
+    def __init__(self, vocab_size, num_classes, dim, nhead, num_layers, max_seq_len=1000):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, dim)
+        self.layers = nn.ModuleList([CausalRecurrentTransformerLayer(dim, nhead) for _ in range(num_layers)])
+        self.layer_norm = nn.LayerNorm(dim)
+        self.fc = nn.Linear(dim, num_classes)
+
+    def forward(self, x, return_residual=False):
+        h = self.embed(x)
+        for layer in self.layers:
+            h = layer(h)
+    
+        h_norm = self.layer_norm(h)
+        logits = self.fc(h_norm)
+        
+        if return_residual:
+            return logits, h 
         return logits
     
 class UniversalACTWrapper(nn.Module):
