@@ -52,34 +52,55 @@ class StandardTransformerLayer(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.ffwd = SwiGLU_FFN(dim)
 
-    def forward(self, x):
-        attn_out, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x))
+    def forward(self, x, causal_mask=None):
+        # Pre-LN architecture (State of the Art for training stability)
+        norm_x = self.norm1(x)
+        
+        # Apply strict causal masking to prevent future-token leakage
+        attn_out, _ = self.attn(norm_x, norm_x, norm_x, attn_mask=causal_mask, is_causal=True)
+        
         x = x + attn_out
         x = x + self.ffwd(self.norm2(x))
         return x
 
 class IndustryStandardLLM(nn.Module):
-    def __init__(self, vocab_size, num_classes, dim, nhead, num_layers, max_seq_len=1000):
+    def __init__(self, vocab_size, num_classes, dim, nhead, num_layers, max_seq_len=5000):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
-        self.pos_encoder = PositionalEncoding(dim, max_seq_len)
+        
+        # Learned absolute positional embeddings (Standard for GPT-style models)
+        self.pos_embed = nn.Embedding(max_seq_len, dim) 
+        
         self.layers = nn.ModuleList([StandardTransformerLayer(dim, nhead) for _ in range(num_layers)])
         self.layer_norm = nn.LayerNorm(dim)
         self.fc = nn.Linear(dim, num_classes)
 
     def forward(self, x, return_residual=False):
-        h = self.embed(x)
-        h = self.pos_encoder(h) 
+        B, T = x.shape
+        device = x.device
         
+        # 1. Generate the causal mask dynamically for the current sequence length
+        # This creates a matrix of 0s and -infs to mask the upper triangle
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(T, device=device)
+        
+        # 2. Embeddings + Positions
+        positions = torch.arange(0, T, device=device).unsqueeze(0)
+        h = self.embed(x) + self.pos_embed(positions)
+        
+        # 3. Pass through Decoder Layers
         for layer in self.layers:
-            h = layer(h)
+            h = layer(h, causal_mask=causal_mask)
             
         residual_state = h 
-        h_final = self.layer_norm(h[:, -1, :])
-        logits = self.fc(h_final)
+        
+        # 4. Final Norm and Projection across the ENTIRE sequence
+        h_norm = self.layer_norm(h)
+        logits = self.fc(h_norm) 
         
         if return_residual:
             return logits, residual_state
+            
+        # Returns [Batch, SeqLen, NumClasses] so the CoT loop can grade intermediate steps
         return logits
 
 # ==========================================

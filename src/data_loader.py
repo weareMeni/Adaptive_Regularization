@@ -153,20 +153,19 @@ def get_listops_loaders(batch_size):
 
 class CoTListOpsDataset(Dataset):
     def __init__(self, num_samples, max_depth=3, max_seq_len=256):
-        """
-        Generates ListOps sequences with full step-by-step Chain of Thought traces.
-        Vocab: 
-        0: <PAD>, 1-9: Digits
-        10: MIN, 11: MAX, 12: MED, 13: SM (Sum Modulo 10)
-        14: '[', 15: ']'
-        16: '=', 17: '<EOS>'
-        """
         self.num_samples = num_samples
         self.max_depth = max_depth
         self.max_seq_len = max_seq_len
-        self.vocab_size = 18
         
-        self.ops = {10: "MIN", 11: "MAX", 12: "MED", 13: "SM"}
+        # VOCABULARY SHIFT:
+        # 0: <PAD>
+        # 1-10: Digits 0-9
+        # 11: MIN, 12: MAX, 13: MED, 14: SM (Sum Modulo 10)
+        # 15: '[', 16: ']'
+        # 17: '=', 18: '<EOS>'
+        self.vocab_size = 19 
+        
+        self.ops = {11: "MIN", 12: "MAX", 13: "MED", 14: "SM"}
         self.op_keys = list(self.ops.keys())
         
         self.data = []
@@ -174,7 +173,6 @@ class CoTListOpsDataset(Dataset):
             prompt, trace = self._generate_sample(self.max_depth)
             full_seq = prompt + trace
             
-            # Pad or truncate
             if len(full_seq) > max_seq_len:
                 full_seq = full_seq[:max_seq_len]
             else:
@@ -185,85 +183,79 @@ class CoTListOpsDataset(Dataset):
         self.data = torch.tensor(self.data, dtype=torch.long)
 
     def _generate_tree(self, depth):
-        """Recursively generates the initial ListOps tree."""
         if depth == 0 or random.random() < 0.2:
-            return [random.randint(0, 9)]
+            return [random.randint(0, 9) + 1] # Shift digit up by 1
         
         op = random.choice(self.op_keys)
         length = random.randint(2, 4)
         
-        tokens = [14, op] # '[', OP
+        tokens = [15, op] # '[', OP
         for _ in range(length):
             tokens.extend(self._generate_tree(depth - 1))
-        tokens.append(15) # ']'
+        tokens.append(16) # ']'
         return tokens
 
     def _resolve_innermost_step(self, tokens):
-        """Finds the first innermost bracket, evaluates it, and returns the new sequence."""
         start_idx, end_idx = -1, -1
         for i, t in enumerate(tokens):
-            if t == 14: # '['
+            if t == 15: # '['
                 start_idx = i
-            elif t == 15 and start_idx != -1: # ']'
+            elif t == 16 and start_idx != -1: # ']'
                 end_idx = i
                 break
         
-        # If no brackets are left, we are done
         if start_idx == -1:
             return tokens, False
             
         op = tokens[start_idx + 1]
-        nums = tokens[start_idx + 2 : end_idx]
         
-        if op == 10: res = min(nums)
-        elif op == 11: res = max(nums)
-        elif op == 12: res = int(np.median(nums))
-        elif op == 13: res = sum(nums) % 10
-        else: res = 0 # Fallback
+        # Extract numbers and shift them back down to 0-9 for real math
+        nums = [t - 1 for t in tokens[start_idx + 2 : end_idx]]
         
-        # Substitute the evaluated bracket with the result
-        new_tokens = tokens[:start_idx] + [res] + tokens[end_idx + 1:]
+        if op == 11: res = min(nums)
+        elif op == 12: res = max(nums)
+        elif op == 13: res = int(np.median(nums))
+        elif op == 14: res = sum(nums) % 10
+        else: res = 0 
+        
+        # Shift the mathematical result back up by 1 for the vocabulary
+        new_tokens = tokens[:start_idx] + [res + 1] + tokens[end_idx + 1:]
         return new_tokens, True
 
     def _generate_sample(self, depth):
-        """Generates the prompt and the sequential CoT trace."""
         tree = self._generate_tree(depth)
-        while len(tree) == 1: # Ensure it's not just a trivial single digit
+        while len(tree) == 1: 
             tree = self._generate_tree(depth)
             
         prompt = tree.copy()
         trace = []
         
-        # Iteratively reduce the tree until only one number remains
         current_state = tree.copy()
         while True:
             current_state, changed = self._resolve_innermost_step(current_state)
             if not changed:
                 break
-            trace.append(16) # '='
+            trace.append(17) # '='
             trace.extend(current_state)
             
-        trace.append(17) # '<EOS>'
+        trace.append(18) # '<EOS>'
         return prompt, trace
 
     def __getitem__(self, idx):
-        # Shift targets for autoregressive next-token prediction
         seq = self.data[idx]
-        x = seq[:-1]
-        y = seq[1:]
-        return x, y
+        return seq[:-1], seq[1:]
 
     def __len__(self):
         return self.num_samples
 
 def get_cot_listops_loaders(batch_size, train_samples=10000, test_samples=1000, train_depth=3, test_depth=5):
     """Returns dataloaders for the CoT ListOps task."""
-    # Note: Sequences get very long when generating traces. 
-    # Max seq len of 256 is safe for depth-3, but depth-5 may need 512.
+    # INCREASED MAX_SEQ_LEN TO PREVENT TRUNCATION OF DEPTH-5 TREES
     train_dataset = CoTListOpsDataset(train_samples, max_depth=train_depth, max_seq_len=256)
-    test_dataset = CoTListOpsDataset(test_samples, max_depth=test_depth, max_seq_len=512)
+    test_dataset = CoTListOpsDataset(test_samples, max_depth=test_depth, max_seq_len=4096) 
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    test_batch_size = 4 
+    test_loader = DataLoader(test_dataset, batch_size=test_batch_size, shuffle=False)
     
-    return train_loader, test_loader, train_dataset.vocab_size, train_dataset.vocab_size, 512, 100
+    return train_loader, test_loader, train_dataset.vocab_size, train_dataset.vocab_size, 4096, 100
